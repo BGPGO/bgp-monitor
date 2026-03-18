@@ -19,7 +19,7 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 
-const VERSION = 'v3';
+const VERSION = 'v4';
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -268,9 +268,11 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const parts = url.pathname.split('/').filter(Boolean);
 
+  console.log(`[REQ] ${req.method} ${req.url} -> parts: ${JSON.stringify(parts)}`);
+
   // GET /ping/:scriptName
-  if (parts[0] === 'ping' && parts[1]) {
-    const name = decodeURIComponent(parts[1]);
+  if (parts[0] === 'ping' && parts.length >= 2) {
+    const name = decodeURIComponent(parts.slice(1).join('/'));
     const wasLate = heartbeats[name]?.alertSent;
     heartbeats[name] = {
       lastPing: new Date(),
@@ -278,7 +280,7 @@ const server = http.createServer((req, res) => {
       lastError: null,
       alertSent: false
     };
-    console.log(`[PING] ${name} OK`);
+    console.log(`[PING] Saved: ${name} | Total scripts: ${Object.keys(heartbeats).length}`);
 
     // Se estava atrasado e voltou, avisa
     if (wasLate) {
