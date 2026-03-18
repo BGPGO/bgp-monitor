@@ -19,7 +19,8 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 
-const VERSION = 'v6';
+const VERSION = 'v7';
+const { Client: PgClient } = require('pg');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -28,6 +29,25 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '5018943895';
 const GRACE_HOURS = parseFloat(process.env.GRACE_HOURS || '3');
 const CHECK_INTERVAL_MIN = parseFloat(process.env.CHECK_INTERVAL_MIN || '30');
 const TELEGRAM_POLL_SEC = 5;
+const MORNING_HOUR = 8; // 8h Brasilia
+const GITHUB_ORG = 'BGPGO';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+
+// Colaboradores monitorados
+const TEAM = {
+  'ae1f50da-000e-4db6-b4f1-5027a782321e': { name: 'Caio', github: ['caioBertuzzi'] },
+  'aff0dba8-4ad1-4dcd-92f0-d1107da6e3a2': { name: 'Oliver', github: ['Aimocorp', 'oliver'] },
+  '5e62ef84-e6a5-4b0f-ad7b-f90ee6f9668b': { name: 'Edu', github: ['Eduardo Lasacoski', 'edulasacoski'] },
+};
+
+const PG_CONFIG = {
+  host: 'aws-1-sa-east-1.pooler.supabase.com',
+  port: 6543,
+  user: 'postgres.pbtheffdoebfryttkyge',
+  password: 'fiffUd-1turpe-nikhyg',
+  database: 'postgres',
+  ssl: { rejectUnauthorized: false }
+};
 
 // ─── State ──────────────────────────────────────────────────────────────────
 const heartbeats = {};
@@ -105,6 +125,8 @@ async function pollTelegram() {
         await handleServer(chatId);
       } else if (text === '/erros' || text === '/errors' || text === '/log') {
         await handleErrors(chatId);
+      } else if (text === '/briefing' || text === '/equipe' || text === '/morning') {
+        await handleBriefing(chatId);
       } else if (text === '/help' || text === '/start' || text === '/ajuda') {
         await handleHelp(chatId, userName);
       } else {
@@ -218,15 +240,217 @@ async function handleHelp(chatId, name) {
     `Fala ${name}! Sou o BGP Monitor.`,
     '',
     'Comandos:',
-    '/status  - Saude de todos os scripts',
-    '/server  - BGPSERVER ta vivo?',
-    '/erros   - Ultimos erros',
-    '/help    - Essa mensagem',
+    '/status   - Saude de todos os scripts',
+    '/server   - BGPSERVER ta vivo?',
+    '/briefing - Resumo: ontem (GitHub) + hoje (demandas)',
+    '/erros    - Ultimos erros',
+    '/help     - Essa mensagem',
     '',
     `Grace period: ${GRACE_HOURS}h`,
     `Scripts monitorados: ${Object.keys(heartbeats).length || 'nenhum ainda'}`,
   ].join('\n');
   await sendTelegram(msg, chatId);
+}
+
+// ─── GitHub: commits de ontem ────────────────────────────────────────────────
+function httpsGet(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const opts = new URL(url);
+    const req = https.get({
+      hostname: opts.hostname, path: opts.pathname + opts.search,
+      headers: { 'User-Agent': 'BGP-Monitor', Accept: 'application/vnd.github+json', ...headers }
+    }, res => {
+      let body = ''; res.on('data', c => body += c);
+      res.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve([]); } });
+    });
+    req.on('error', reject);
+  });
+}
+
+async function getYesterdayCommits() {
+  const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
+  const since = yesterday.toISOString().slice(0, 10) + 'T00:00:00Z';
+  const until = new Date().toISOString().slice(0, 10) + 'T00:00:00Z';
+  const authHeader = GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {};
+
+  // Get all repos
+  let repos = [];
+  try {
+    repos = await httpsGet(`https://api.github.com/orgs/${GITHUB_ORG}/repos?per_page=50`, authHeader);
+    if (!Array.isArray(repos)) repos = [];
+  } catch { repos = []; }
+
+  // All github aliases (lowercase)
+  const allAliases = {};
+  for (const [id, info] of Object.entries(TEAM)) {
+    for (const alias of info.github) allAliases[alias.toLowerCase()] = id;
+  }
+
+  // Collect commits per person
+  const commitsByPerson = {}; // id -> [{repo, msg, time}]
+  for (const id of Object.keys(TEAM)) commitsByPerson[id] = [];
+
+  for (const repo of repos) {
+    try {
+      const commits = await httpsGet(
+        `https://api.github.com/repos/${repo.full_name}/commits?since=${since}&until=${until}&per_page=100`,
+        authHeader
+      );
+      if (!Array.isArray(commits)) continue;
+      for (const c of commits) {
+        const authorName = (c.commit?.author?.name || '').toLowerCase();
+        const authorLogin = (c.author?.login || '').toLowerCase();
+        const personId = allAliases[authorName] || allAliases[authorLogin];
+        if (personId) {
+          commitsByPerson[personId].push({
+            repo: repo.name,
+            msg: (c.commit?.message || '').split('\n')[0].slice(0, 80),
+            time: c.commit?.author?.date
+          });
+        }
+      }
+    } catch { continue; }
+  }
+
+  return commitsByPerson;
+}
+
+// ─── Demands: tarefas do dia ────────────────────────────────────────────────
+async function getTodayDemands() {
+  const pg = new PgClient(PG_CONFIG);
+  const demandsByPerson = {};
+  for (const id of Object.keys(TEAM)) demandsByPerson[id] = [];
+
+  try {
+    await pg.connect();
+    const ids = Object.keys(TEAM).map(id => `'${id}'`).join(',');
+    const today = new Date().toISOString().slice(0, 10);
+
+    const result = await pg.query(`
+      SELECT d.title, d.status, d.priority, d.due_date, d.assignee_id,
+             c.full_name as client
+      FROM demands d
+      LEFT JOIN profiles c ON c.id = d.client_id
+      WHERE d.assignee_id IN (${ids})
+        AND d.status NOT IN ('completed', 'cancelled')
+        AND (d.due_date IS NULL OR d.due_date::date <= '${today}'::date)
+      ORDER BY d.priority DESC, d.due_date ASC NULLS LAST
+    `);
+
+    for (const row of result.rows) {
+      if (demandsByPerson[row.assignee_id]) {
+        demandsByPerson[row.assignee_id].push({
+          title: row.title,
+          status: row.status,
+          priority: row.priority,
+          client: row.client ? row.client.slice(0, 25) : '',
+          due: row.due_date ? new Date(row.due_date).toISOString().slice(0, 10) : ''
+        });
+      }
+    }
+  } catch (e) {
+    console.error('[Demands error]', e.message);
+  } finally {
+    await pg.end().catch(() => {});
+  }
+
+  return demandsByPerson;
+}
+
+// ─── Briefing ───────────────────────────────────────────────────────────────
+async function buildBriefing() {
+  const [commits, demands] = await Promise.all([
+    getYesterdayCommits().catch(() => ({})),
+    getTodayDemands().catch(() => ({}))
+  ]);
+
+  const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayStr = yesterday.toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+  const todayStr = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+
+  const lines = [`--- BRIEFING ${todayStr} ---`, ''];
+
+  for (const [id, info] of Object.entries(TEAM)) {
+    lines.push(`>> ${info.name.toUpperCase()}`);
+
+    // Ontem (GitHub)
+    const personCommits = (commits[id] || []);
+    if (personCommits.length > 0) {
+      lines.push(`  Ontem (${yesterdayStr}) - ${personCommits.length} commits:`);
+      // Group by repo
+      const byRepo = {};
+      for (const c of personCommits) {
+        if (!byRepo[c.repo]) byRepo[c.repo] = [];
+        byRepo[c.repo].push(c.msg);
+      }
+      for (const [repo, msgs] of Object.entries(byRepo)) {
+        lines.push(`    [${repo}]`);
+        for (const msg of msgs.slice(0, 5)) {
+          lines.push(`    - ${msg}`);
+        }
+        if (msgs.length > 5) lines.push(`    ... +${msgs.length - 5} commits`);
+      }
+    } else {
+      lines.push(`  Ontem: sem commits no GitHub`);
+    }
+
+    // Hoje (Demands)
+    const personDemands = (demands[id] || []);
+    if (personDemands.length > 0) {
+      lines.push(`  Hoje - ${personDemands.length} demandas:`);
+      for (const d of personDemands.slice(0, 8)) {
+        const pri = d.priority === 'high' ? '!!' : d.priority === 'urgent' ? '!!!' : '';
+        const client = d.client ? ` (${d.client})` : '';
+        lines.push(`    ${pri} ${d.title}${client}`);
+      }
+      if (personDemands.length > 8) lines.push(`    ... +${personDemands.length - 8} demandas`);
+    } else {
+      lines.push(`  Hoje: sem demandas pendentes`);
+    }
+
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+async function handleBriefing(chatId) {
+  await sendTelegram('Gerando briefing... aguarde', chatId);
+  try {
+    const text = await buildBriefing();
+    // Split if too long (Telegram limit 4096 chars)
+    if (text.length > 4000) {
+      const mid = text.lastIndexOf('\n\n', 2000);
+      await sendTelegram(text.slice(0, mid), chatId);
+      await sendTelegram(text.slice(mid), chatId);
+    } else {
+      await sendTelegram(text, chatId);
+    }
+  } catch (e) {
+    await sendTelegram(`Erro ao gerar briefing: ${e.message}`, chatId);
+  }
+}
+
+// ─── Morning auto-briefing (8h Brasilia) ────────────────────────────────────
+let lastBriefingDate = '';
+function checkMorningBriefing() {
+  const now = new Date();
+  const brHour = parseInt(now.toLocaleString('en-US', { timeZone: 'America/Sao_Paulo', hour: 'numeric', hour12: false }));
+  const brDate = now.toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+
+  if (brHour === MORNING_HOUR && brDate !== lastBriefingDate) {
+    lastBriefingDate = brDate;
+    console.log(`[Briefing] Sending morning briefing at ${brDate} ${brHour}h`);
+    buildBriefing()
+      .then(text => {
+        if (text.length > 4000) {
+          const mid = text.lastIndexOf('\n\n', 2000);
+          return sendTelegram(text.slice(0, mid)).then(() => sendTelegram(text.slice(mid)));
+        }
+        return sendTelegram(text);
+      })
+      .catch(e => console.error('[Briefing error]', e.message));
+  }
 }
 
 // ─── Dead Man's Switch Check ────────────────────────────────────────────────
@@ -331,8 +555,11 @@ server.listen(PORT, () => {
   console.log(`Grace period: ${GRACE_HOURS}h | Check: ${CHECK_INTERVAL_MIN}min | Poll: ${TELEGRAM_POLL_SEC}s`);
   console.log(`Telegram bot polling ativo`);
 
-  // Cron: checa heartbeats
+  // Cron: checa heartbeats (cada 30min)
   setInterval(checkHeartbeats, CHECK_INTERVAL_MIN * 60 * 1000);
+
+  // Cron: briefing matinal (checa a cada 5min se sao 8h Brasilia)
+  setInterval(checkMorningBriefing, 5 * 60 * 1000);
 
   // Telegram polling
   setInterval(pollTelegram, TELEGRAM_POLL_SEC * 1000);
