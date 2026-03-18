@@ -19,7 +19,7 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 
-const VERSION = 'v5';
+const VERSION = 'v6';
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -272,8 +272,8 @@ const server = http.createServer((req, res) => {
 
   console.log(`[REQ] ${req.url} parts=${JSON.stringify(parts)} hb_keys=${JSON.stringify(Object.keys(heartbeats))}`);
 
-  // GET /ping/:scriptName
-  if (parts[0] === 'ping' && parts.length >= 2) {
+  // GET /hb/:scriptName (heartbeat)
+  if (parts[0] === 'hb' && parts.length >= 2) {
     const name = decodeURIComponent(parts.slice(1).join('/'));
     const wasLate = heartbeats[name] && heartbeats[name].alertSent;
     heartbeats[name] = { lastPing: new Date(), status: 'OK', lastError: null, alertSent: false };
@@ -286,8 +286,8 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // GET /fail/:scriptName?err=...
-  if (parts[0] === 'fail' && parts.length >= 2) {
+  // GET /err/:scriptName?err=...
+  if (parts[0] === 'err' && parts.length >= 2) {
     const name = decodeURIComponent(parts.slice(1).join('/'));
     const errorMsg = params.get('err') || 'Erro desconhecido';
     heartbeats[name] = { lastPing: new Date(), status: 'ERROR', lastError: errorMsg, alertSent: false };
