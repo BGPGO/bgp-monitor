@@ -19,6 +19,8 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 
+const VERSION = 'v3';
+
 // ─── Config ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8330277879:AAEP8GA04teWfpFDWDjrR64X1CCmfdsp4L0';
@@ -345,7 +347,7 @@ const server = http.createServer((req, res) => {
   // GET /
   if (url.pathname === '/' || url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('BGP Monitor running');
+    res.end(`BGP Monitor ${VERSION} running | scripts: ${Object.keys(heartbeats).length}`);
     return;
   }
 
