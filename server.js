@@ -19,7 +19,7 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 
-const VERSION = 'v7';
+const VERSION = 'v8';
 const { Client: PgClient } = require('pg');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -32,6 +32,7 @@ const TELEGRAM_POLL_SEC = 5;
 const MORNING_HOUR = 8; // 8h Brasilia
 const GITHUB_ORG = 'BGPGO';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 
 // Colaboradores monitorados
 const TEAM = {
@@ -315,11 +316,60 @@ async function getYesterdayCommits() {
   return commitsByPerson;
 }
 
-// ─── Demands: tarefas do dia ────────────────────────────────────────────────
+// ─── Claude Haiku: resumo com IA ────────────────────────────────────────────
+function callClaude(prompt) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 500,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const req = https.request({
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Length': Buffer.byteLength(data)
+      }
+    }, res => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(body);
+          resolve(j.content?.[0]?.text || 'Sem resumo');
+        } catch { resolve('Erro ao parsear resposta IA'); }
+      });
+    });
+    req.on('error', () => resolve('IA indisponivel'));
+    req.setTimeout(15000, () => { req.destroy(); resolve('IA timeout'); });
+    req.write(data);
+    req.end();
+  });
+}
+
+async function summarizeCommits(repoName, commitMsgs) {
+  if (commitMsgs.length === 0) return null;
+  const prompt = `Voce e um assistente que resume atividades de desenvolvimento para gestores nao-tecnicos.
+
+Projeto: ${repoName}
+Commits de ontem:
+${commitMsgs.map(m => `- ${m}`).join('\n')}
+
+Resuma em 1-2 frases curtas e objetivas em portugues o que foi feito nesse projeto. Foque no resultado para o negocio, nao em termos tecnicos. Seja direto, sem introducao.`;
+
+  return callClaude(prompt);
+}
+
+// ─── Demands: tarefas do dia (agrupadas por projeto) ────────────────────────
 async function getTodayDemands() {
   const pg = new PgClient(PG_CONFIG);
+  // Returns: { personId: { projectName: [titles...] } }
   const demandsByPerson = {};
-  for (const id of Object.keys(TEAM)) demandsByPerson[id] = [];
+  for (const id of Object.keys(TEAM)) demandsByPerson[id] = {};
 
   try {
     await pg.connect();
@@ -327,26 +377,22 @@ async function getTodayDemands() {
     const today = new Date().toISOString().slice(0, 10);
 
     const result = await pg.query(`
-      SELECT d.title, d.status, d.priority, d.due_date, d.assignee_id,
-             c.full_name as client
+      SELECT d.title, d.priority, d.assignee_id,
+             COALESCE(pr.name, 'Geral') as project
       FROM demands d
-      LEFT JOIN profiles c ON c.id = d.client_id
+      LEFT JOIN projects pr ON pr.id = d.project_id
       WHERE d.assignee_id IN (${ids})
         AND d.status NOT IN ('completed', 'cancelled')
         AND (d.due_date IS NULL OR d.due_date::date <= '${today}'::date)
-      ORDER BY d.priority DESC, d.due_date ASC NULLS LAST
+      ORDER BY pr.name, d.priority DESC
     `);
 
     for (const row of result.rows) {
-      if (demandsByPerson[row.assignee_id]) {
-        demandsByPerson[row.assignee_id].push({
-          title: row.title,
-          status: row.status,
-          priority: row.priority,
-          client: row.client ? row.client.slice(0, 25) : '',
-          due: row.due_date ? new Date(row.due_date).toISOString().slice(0, 10) : ''
-        });
-      }
+      const person = demandsByPerson[row.assignee_id];
+      if (!person) continue;
+      const proj = row.project || 'Geral';
+      if (!person[proj]) person[proj] = [];
+      person[proj].push({ title: row.title, priority: row.priority });
     }
   } catch (e) {
     console.error('[Demands error]', e.message);
@@ -368,50 +414,75 @@ async function buildBriefing() {
   const yesterdayStr = yesterday.toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
   const todayStr = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
 
-  const lines = [`--- BRIEFING ${todayStr} ---`, ''];
-
+  // --- PARTE 1: Resumo por projeto (GitHub) com IA ---
+  // Agrupar todos os commits por repo (de todas as pessoas)
+  const allByRepo = {};
   for (const [id, info] of Object.entries(TEAM)) {
-    lines.push(`>> ${info.name.toUpperCase()}`);
-
-    // Ontem (GitHub)
-    const personCommits = (commits[id] || []);
-    if (personCommits.length > 0) {
-      lines.push(`  Ontem (${yesterdayStr}) - ${personCommits.length} commits:`);
-      // Group by repo
-      const byRepo = {};
-      for (const c of personCommits) {
-        if (!byRepo[c.repo]) byRepo[c.repo] = [];
-        byRepo[c.repo].push(c.msg);
-      }
-      for (const [repo, msgs] of Object.entries(byRepo)) {
-        lines.push(`    [${repo}]`);
-        for (const msg of msgs.slice(0, 5)) {
-          lines.push(`    - ${msg}`);
-        }
-        if (msgs.length > 5) lines.push(`    ... +${msgs.length - 5} commits`);
-      }
-    } else {
-      lines.push(`  Ontem: sem commits no GitHub`);
+    for (const c of (commits[id] || [])) {
+      if (!allByRepo[c.repo]) allByRepo[c.repo] = { msgs: [], authors: new Set() };
+      allByRepo[c.repo].msgs.push(c.msg);
+      allByRepo[c.repo].authors.add(info.name);
     }
-
-    // Hoje (Demands)
-    const personDemands = (demands[id] || []);
-    if (personDemands.length > 0) {
-      lines.push(`  Hoje - ${personDemands.length} demandas:`);
-      for (const d of personDemands.slice(0, 8)) {
-        const pri = d.priority === 'high' ? '!!' : d.priority === 'urgent' ? '!!!' : '';
-        const client = d.client ? ` (${d.client})` : '';
-        lines.push(`    ${pri} ${d.title}${client}`);
-      }
-      if (personDemands.length > 8) lines.push(`    ... +${personDemands.length - 8} demandas`);
-    } else {
-      lines.push(`  Hoje: sem demandas pendentes`);
-    }
-
-    lines.push('');
   }
 
-  return lines.join('\n');
+  const part1 = [`--- O QUE FOI FEITO ONTEM (${yesterdayStr}) ---`, ''];
+
+  if (Object.keys(allByRepo).length === 0) {
+    part1.push('Nenhum commit no GitHub ontem.');
+  } else {
+    // Summarize each repo with AI (in parallel)
+    const summaryPromises = Object.entries(allByRepo).map(async ([repo, data]) => {
+      const summary = await summarizeCommits(repo, data.msgs);
+      return { repo, summary, authors: [...data.authors], count: data.msgs.length };
+    });
+    const summaries = await Promise.all(summaryPromises);
+
+    for (const s of summaries) {
+      part1.push(`[${s.repo}] (${s.count} alteracoes - ${s.authors.join(', ')})`);
+      part1.push(`  ${s.summary}`);
+      part1.push('');
+    }
+  }
+
+  // --- PARTE 2: Demandas de hoje por pessoa, agrupadas por projeto ---
+  const part2 = [`--- AGENDA DE HOJE (${todayStr}) ---`, ''];
+
+  for (const [id, info] of Object.entries(TEAM)) {
+    const personDemands = demands[id] || {};
+    const projects = Object.entries(personDemands);
+    const totalCount = projects.reduce((s, [, items]) => s + items.length, 0);
+
+    part2.push(`>> ${info.name.toUpperCase()} (${totalCount} demandas)`);
+
+    if (totalCount === 0) {
+      part2.push('  Sem demandas pendentes');
+    } else {
+      for (const [proj, items] of projects) {
+        const highCount = items.filter(i => i.priority === 'high' || i.priority === 'urgent').length;
+        const priLabel = highCount > 0 ? ` (${highCount} urgente)` : '';
+        if (items.length <= 3) {
+          // Poucas: lista todas
+          part2.push(`  ${proj}${priLabel}:`);
+          for (const item of items) {
+            const pri = item.priority === 'urgent' ? '!!! ' : item.priority === 'high' ? '!! ' : '';
+            part2.push(`    ${pri}${item.title}`);
+          }
+        } else {
+          // Muitas: conta + lista urgentes
+          const urgents = items.filter(i => i.priority === 'high' || i.priority === 'urgent');
+          part2.push(`  ${proj}: ${items.length} tarefas${priLabel}`);
+          if (urgents.length > 0) {
+            for (const u of urgents) {
+              part2.push(`    !! ${u.title}`);
+            }
+          }
+        }
+      }
+    }
+    part2.push('');
+  }
+
+  return part1.join('\n') + '\n' + part2.join('\n');
 }
 
 async function handleBriefing(chatId) {
