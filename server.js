@@ -19,7 +19,7 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 
-const VERSION = 'v4';
+const VERSION = 'v5';
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -265,61 +265,37 @@ function checkHeartbeats() {
 
 // ─── HTTP Server ────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-  const parts = url.pathname.split('/').filter(Boolean);
+  // Simple path parsing without URL constructor (more compatible)
+  const [pathPart, queryPart] = (req.url || '/').split('?');
+  const parts = pathPart.split('/').filter(Boolean);
+  const params = new URLSearchParams(queryPart || '');
 
-  console.log(`[REQ] ${req.method} ${req.url} -> parts: ${JSON.stringify(parts)}`);
+  console.log(`[REQ] ${req.url} parts=${JSON.stringify(parts)} hb_keys=${JSON.stringify(Object.keys(heartbeats))}`);
 
   // GET /ping/:scriptName
   if (parts[0] === 'ping' && parts.length >= 2) {
     const name = decodeURIComponent(parts.slice(1).join('/'));
-    const wasLate = heartbeats[name]?.alertSent;
-    heartbeats[name] = {
-      lastPing: new Date(),
-      status: 'OK',
-      lastError: null,
-      alertSent: false
-    };
-    console.log(`[PING] Saved: ${name} | Total scripts: ${Object.keys(heartbeats).length}`);
-
-    // Se estava atrasado e voltou, avisa
+    const wasLate = heartbeats[name] && heartbeats[name].alertSent;
+    heartbeats[name] = { lastPing: new Date(), status: 'OK', lastError: null, alertSent: false };
+    console.log(`[PING] ${name} saved. Total: ${Object.keys(heartbeats).length}`);
     if (wasLate) {
       sendTelegram(`RECUPERADO - ${name}\n\nVoltou a pingar em ${brDate(new Date())}`).catch(() => {});
     }
-
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('OK');
+    res.end(`OK:${name}:${Object.keys(heartbeats).length}`);
     return;
   }
 
   // GET /fail/:scriptName?err=...
-  if (parts[0] === 'fail' && parts[1]) {
-    const name = decodeURIComponent(parts[1]);
-    const errorMsg = url.searchParams.get('err') || 'Erro desconhecido';
-    const timestamp = brDate(new Date());
-
-    heartbeats[name] = {
-      lastPing: new Date(),
-      status: 'ERROR',
-      lastError: errorMsg,
-      alertSent: false
-    };
-
-    // Salva no log de erros
+  if (parts[0] === 'fail' && parts.length >= 2) {
+    const name = decodeURIComponent(parts.slice(1).join('/'));
+    const errorMsg = params.get('err') || 'Erro desconhecido';
+    heartbeats[name] = { lastPing: new Date(), status: 'ERROR', lastError: errorMsg, alertSent: false };
     errorLog.push({ time: new Date(), script: name, error: errorMsg });
     if (errorLog.length > 50) errorLog.shift();
-
-    const msg = [
-      `ERRO - ${name}`,
-      ``,
-      `${timestamp}`,
-      ``,
-      `${errorMsg.slice(0, 800)}`
-    ].join('\n');
-
+    const msg = `ERRO - ${name}\n\n${brDate(new Date())}\n\n${errorMsg.slice(0, 800)}`;
     console.log(`[FAIL] ${name}: ${errorMsg.slice(0, 100)}`);
     sendTelegram(msg).catch(e => console.error('[Telegram error]', e.message));
-
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('FAIL registered');
     return;
@@ -328,26 +304,18 @@ const server = http.createServer((req, res) => {
   // GET /status
   if (parts[0] === 'status') {
     const now = Date.now();
-    const status = Object.entries(heartbeats).map(([name, hb]) => ({
-      script: name,
-      status: hb.status,
-      lastPing: hb.lastPing.toISOString(),
+    const scripts = Object.entries(heartbeats).map(([n, hb]) => ({
+      script: n, status: hb.status, lastPing: hb.lastPing.toISOString(),
       minutesAgo: Math.round((now - hb.lastPing.getTime()) / 60000),
-      alertSent: hb.alertSent,
-      lastError: hb.lastError
+      alertSent: hb.alertSent, lastError: hb.lastError
     }));
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      monitor_since: monitorStartedAt.toISOString(),
-      grace_hours: GRACE_HOURS,
-      scripts: status,
-      recent_errors: errorLog.slice(-5)
-    }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, monitor_since: monitorStartedAt.toISOString(), grace_hours: GRACE_HOURS, scripts, recent_errors: errorLog.slice(-5) }, null, 2));
     return;
   }
 
   // GET /
-  if (url.pathname === '/' || url.pathname === '/health') {
+  if (pathPart === '/' || pathPart === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end(`BGP Monitor ${VERSION} running | scripts: ${Object.keys(heartbeats).length}`);
     return;
