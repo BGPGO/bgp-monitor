@@ -38,7 +38,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const TEAM = {
   'ae1f50da-000e-4db6-b4f1-5027a782321e': { name: 'Caio', github: ['caioBertuzzi'] },
   'aff0dba8-4ad1-4dcd-92f0-d1107da6e3a2': { name: 'Oliver', github: ['Aimocorp', 'oliver'] },
-  '5e62ef84-e6a5-4b0f-ad7b-f90ee6f9668b': { name: 'Edu', github: ['Eduardo Lasacoski', 'edulasacoski'] },
+  '5e62ef84-e6a5-4b0f-ad7b-f90ee6f9668b': { name: 'Edu', github: ['Eduardo Lasacoski', 'edulasacoski', 'dulasacoski'] },
 };
 
 const PG_CONFIG = {
@@ -269,9 +269,14 @@ function httpsGet(url, headers = {}) {
 }
 
 async function getYesterdayCommits() {
-  const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
-  const since = yesterday.toISOString().slice(0, 10) + 'T00:00:00Z';
-  const until = new Date().toISOString().slice(0, 10) + 'T00:00:00Z';
+  // Janela: 8h Brasilia (11h UTC) de ontem ate 8h Brasilia (11h UTC) de hoje
+  const now = new Date();
+  const todayCut = new Date(now); todayCut.setUTCHours(11, 0, 0, 0);
+  const yesterdayCut = new Date(todayCut); yesterdayCut.setUTCDate(yesterdayCut.getUTCDate() - 1);
+  // Se ainda nao passou das 8h Brasilia, recua 1 dia
+  if (now < todayCut) { todayCut.setUTCDate(todayCut.getUTCDate() - 1); yesterdayCut.setUTCDate(yesterdayCut.getUTCDate() - 1); }
+  const since = yesterdayCut.toISOString();
+  const until = todayCut.toISOString();
   const authHeader = GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {};
 
   // Get all repos
@@ -410,8 +415,7 @@ async function buildBriefing() {
     getTodayDemands().catch(() => ({}))
   ]);
 
-  const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
-  const yesterdayStr = yesterday.toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+  const yesterdayStr = new Date(Date.now() - 86400000).toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
   const todayStr = new Date().toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' });
 
   // --- PARTE 1: Resumo por projeto (GitHub) com IA ---
