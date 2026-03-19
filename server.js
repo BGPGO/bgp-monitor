@@ -19,7 +19,7 @@ const http = require('http');
 const https = require('https');
 const os = require('os');
 
-const VERSION = 'v8';
+const VERSION = 'v9';
 const { Client: PgClient } = require('pg');
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -659,6 +659,13 @@ server.listen(PORT, () => {
   console.log(`BGP Monitor rodando na porta ${PORT}`);
   console.log(`Grace period: ${GRACE_HOURS}h | Check: ${CHECK_INTERVAL_MIN}min | Poll: ${TELEGRAM_POLL_SEC}s`);
   console.log(`Telegram bot polling ativo`);
+
+  // Self-heartbeat: registra o proprio servidor como script monitorado
+  function selfHeartbeat() {
+    heartbeats['bgp-servidor'] = { lastPing: new Date(), status: 'OK', lastError: null, alertSent: false };
+  }
+  selfHeartbeat();
+  setInterval(selfHeartbeat, 5 * 60 * 1000); // a cada 5min
 
   // Cron: checa heartbeats (cada 30min)
   setInterval(checkHeartbeats, CHECK_INTERVAL_MIN * 60 * 1000);
