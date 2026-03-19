@@ -326,7 +326,7 @@ function callClaude(prompt) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify({
       model: 'claude-haiku-4-5-20251001',
-      max_tokens: 500,
+      max_tokens: 1024,
       messages: [{ role: 'user', content: prompt }]
     });
     const req = https.request({
@@ -356,17 +356,47 @@ function callClaude(prompt) {
   });
 }
 
+function fallbackSummary(commitMsgs) {
+  const groups = { feat: [], fix: [], refactor: [], other: [] };
+  for (const m of commitMsgs) {
+    const lower = m.toLowerCase();
+    if (lower.startsWith('feat')) groups.feat.push(m.replace(/^feat[:(]?\s*/i, ''));
+    else if (lower.startsWith('fix')) groups.fix.push(m.replace(/^fix[:(]?\s*/i, ''));
+    else if (lower.startsWith('refactor')) groups.refactor.push(m.replace(/^refactor[:(]?\s*/i, ''));
+    else groups.other.push(m);
+  }
+  const lines = [];
+  if (groups.feat.length) lines.push(`  Novo: ${groups.feat.slice(0, 5).join('; ')}${groups.feat.length > 5 ? ` (+${groups.feat.length - 5})` : ''}`);
+  if (groups.fix.length) lines.push(`  Correcoes: ${groups.fix.slice(0, 5).join('; ')}${groups.fix.length > 5 ? ` (+${groups.fix.length - 5})` : ''}`);
+  if (groups.refactor.length) lines.push(`  Refatoracao: ${groups.refactor.slice(0, 3).join('; ')}`);
+  if (groups.other.length) lines.push(`  Outros: ${groups.other.slice(0, 3).join('; ')}`);
+  return lines.join('\n');
+}
+
 async function summarizeCommits(repoName, commitMsgs) {
   if (commitMsgs.length === 0) return null;
-  const prompt = `Voce e um assistente que resume atividades de desenvolvimento para gestores nao-tecnicos.
+
+  const prompt = `Voce e um assistente de briefing executivo para gestores de tecnologia.
 
 Projeto: ${repoName}
-Commits de ontem:
+Total de alteracoes: ${commitMsgs.length}
+
+Lista de commits:
 ${commitMsgs.map(m => `- ${m}`).join('\n')}
 
-Resuma em 1-2 frases curtas e objetivas em portugues o que foi feito nesse projeto. Foque no resultado para o negocio, nao em termos tecnicos. Seja direto, sem introducao.`;
+Gere um resumo em portugues para o gestor entender o progresso do projeto. Regras:
+- Agrupe por area de trabalho (ex: "WhatsApp", "Dashboard", "Automacoes")
+- Para cada area, 1 frase curta do que foi feito e o impacto
+- Se houve muitas correcoes, mencione a estabilidade
+- Maximo 6 linhas. Sem introducao, sem bullet points com "-". Use o formato:
+  [Area] O que foi feito
+- Seja direto e objetivo`;
 
-  return callClaude(prompt);
+  const aiResult = await callClaude(prompt);
+  if (aiResult && !aiResult.includes('indisponivel') && !aiResult.includes('timeout') && !aiResult.includes('Sem resumo') && !aiResult.includes('Erro')) {
+    return aiResult;
+  }
+  return fallbackSummary(commitMsgs);
 }
 
 // ─── Demands: tarefas do dia (agrupadas por projeto) ────────────────────────
